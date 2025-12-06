@@ -1,0 +1,22 @@
+{
+  "name": "bfhub.app_portalsdk",
+  "version": "0.0.1",
+  "description": "BFHub.app portalsdk version",
+  "main": "index.js",
+  "directories": {
+    "test": "tests"
+  },
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/bfhub-app/PortalSDK-Community.git"
+  },
+  "author": "bfhub.app",
+  "license": "ISC",
+  "bugs": {
+    "url": "https://github.com/bfhub-app/PortalSDK-Community/issues"
+  },
+  "homepage": "https://github.com/bfhub-app/PortalSDK-Community#readme"
+}

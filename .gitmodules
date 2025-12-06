@@ -1,0 +1,3 @@
+[submodule "sdk/battlefield-portal-community"]
+	path = sdk/battlefield-portal-community
+	url = git@github.com:battlefield-portal-community/PortalSDK.git

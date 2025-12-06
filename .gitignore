@@ -1,0 +1,32 @@
+# Ignore official channel copies, use just to keep changelogs and compare versioning
+portalsdk_dice-official/
+
+# OS and editor artifacts
+.DS_Store
+*.meta
+Thumbs.db
+
+# Godot 4+ specific ignores
+# https://github.com/github/gitignore/blob/main/Godot.gitignore
+.godot/
+.nomedia
+
+# Godot-specific ignores
+.import/
+export.cfg
+export_credentials.cfg
+*.tmp
+
+# Imported translations (automatically generated from CSV files)
+*.translation
+
+# Mono-specific ignores
+.mono/
+data_*/
+mono_crash.*.json
+
+# Sanitized files from log processing
+*.sanitized
+
+# Debug files (local troubleshooting only)
+debug/
