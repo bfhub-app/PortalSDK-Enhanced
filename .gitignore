@@ -1,5 +1,5 @@
 # Ignore official channel copies, use just to keep changelogs and compare versioning
-portalsdk_dice-official/
+sdk/dice-official/
 
 # OS and editor artifacts
 .DS_Store
@@ -10,6 +10,7 @@ Thumbs.db
 # https://github.com/github/gitignore/blob/main/Godot.gitignore
 .godot/
 .nomedia
+.uid
 
 # Godot-specific ignores
 .import/
@@ -30,3 +31,5 @@ mono_crash.*.json
 
 # Debug files (local troubleshooting only)
 debug/
+
+# Node Specific
