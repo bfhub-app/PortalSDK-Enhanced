@@ -33,3 +33,4 @@ mono_crash.*.json
 debug/
 
 # Node Specific
+dist/
