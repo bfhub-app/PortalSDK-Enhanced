@@ -1,0 +1,101 @@
+name: SDK Check & Update
+
+on:
+  schedule:
+    # Run daily at 2 AM UTC
+    - cron: '0 2 * * *'
+  workflow_dispatch:
+  repository_dispatch:
+    types:
+      - sdk_check_update
+  workflow_call:
+    inputs:
+      reason:
+        description: 'Optional reason for the run'
+        required: false
+        type: string
+
+jobs:
+  check-and-update-subtrees:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+      
+      - name: Configure Git
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+      
+      
+      
+      - name: Check for sdk-mirror updates
+        id: check-mirror
+        run: |
+          git fetch https://github.com/bfhub-app/PortalSDK-Mirror.git main
+          UPSTREAM_COMMIT=$(git rev-parse FETCH_HEAD)
+          CURRENT_COMMIT=$(git log -1 --format=%H -- sdk/sdk-mirror)
+          
+          if [ "$CURRENT_COMMIT" != "$UPSTREAM_COMMIT" ]; then
+            echo "has_updates=true" >> $GITHUB_OUTPUT
+            echo "✅ sdk-mirror has updates available"
+          else
+            echo "has_updates=false" >> $GITHUB_OUTPUT
+            echo "ℹ️ sdk-mirror is up to date"
+          fi
+
+      - name: Check for sdk-community updates
+        id: check-community
+        run: |
+          git fetch https://github.com/bfhub-app/PortalSDK-Community-Mirror.git main
+          UPSTREAM_COMMIT=$(git rev-parse FETCH_HEAD)
+          CURRENT_COMMIT=$(git log -1 --format=%H -- sdk/sdk-community)
+          
+          if [ "$CURRENT_COMMIT" != "$UPSTREAM_COMMIT" ]; then
+            echo "has_updates=true" >> $GITHUB_OUTPUT
+            echo "✅ sdk-community has updates available"
+          else
+            echo "has_updates=false" >> $GITHUB_OUTPUT
+            echo "ℹ️ sdk-community is up to date"
+          fi
+
+      - name: Update sdk-mirror subtree
+        if: steps.check-mirror.outputs.has_updates == 'true'
+        run: |
+          echo "🔄 Updating sdk-mirror..."
+          git subtree pull --prefix=sdk/sdk-mirror https://github.com/bfhub-app/PortalSDK-Mirror.git main --squash -m "chore: update sdk-mirror from upstream"
+      
+      - name: Update sdk-community subtree
+        if: steps.check-community.outputs.has_updates == 'true'
+        run: |
+          echo "🔄 Updating sdk-community..."
+          git subtree pull --prefix=sdk/sdk-community https://github.com/bfhub-app/PortalSDK-Community-Mirror.git main --squash -m "chore: update sdk-community from upstream"
+   
+      - name: Push changes
+        if: steps.check-community.outputs.has_updates == 'true' || steps.check-mirror.outputs.has_updates == 'true'
+        run: |
+          git push origin main
+          echo "✅ Changes pushed successfully"
+      
+      - name: Summary
+        run: |
+          echo "## SDK Update Summary" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          
+          if [ "${{ steps.check-community.outputs.has_updates }}" == "true" ]; then
+            echo "- ✅ **sdk-community** updated" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "- ℹ️ **sdk-community** already up to date" >> $GITHUB_STEP_SUMMARY
+          fi
+          
+          if [ "${{ steps.check-mirror.outputs.has_updates }}" == "true" ]; then
+            echo "- ✅ **sdk-mirror** updated" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "- ℹ️ **sdk-mirror** already up to date" >> $GITHUB_STEP_SUMMARY
+          fi
