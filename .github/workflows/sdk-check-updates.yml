@@ -1,0 +1,975 @@
+name: Check Portal SDK Updates
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+  repository_dispatch:
+    types: [check-sdk-updates]
+  schedule:
+    # Monday: Every hour 8-20 UTC
+    - cron: '0 8-20 * * 1'
+    # Tuesday: Every hour 8-20 UTC
+    - cron: '0 8-20 * * 2'
+    # Wednesday-Friday: Every 4 hours (boost mode will override)
+    - cron: '0 */4 * * 3-5'
+    # Saturday-Sunday: Every 6 hours
+    - cron: '0 */6 * * 0,6'
+    # Normal boost check: Every hour on weekdays
+    - cron: '0 * * * 1-5'
+    # Aggressive boost check: Every 30 minutes on weekdays
+    - cron: '*/30 * * * 1-5'
+
+permissions:
+  contents: write
+  issues: write
+
+concurrency:
+  group: sdk-check-updates
+  cancel-in-progress: true
+
+jobs:
+  check-and-update:
+    name: Check and Update SDK
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      
+      - name: Restore circuit breaker cache
+        uses: actions/cache/restore@v3
+        with:
+          path: .github/cache/failure-tracker.json
+          key: circuit-breaker-${{ github.run_id }}
+          restore-keys: |
+            circuit-breaker-
+      
+      - name: Detect trigger type
+        id: trigger
+        run: |
+          EVENT_NAME="${{ github.event_name }}"
+          echo "📋 GitHub Event: $EVENT_NAME"
+          
+          if [ "$EVENT_NAME" = "workflow_dispatch" ]; then
+            echo "is_manual=true" >> $GITHUB_OUTPUT
+            echo "🔧 Manual trigger detected - bypassing schedule checks"
+          else
+            echo "is_manual=false" >> $GITHUB_OUTPUT
+            echo "⏰ Automatic trigger ($EVENT_NAME) - following schedule"
+          fi
+      
+      - name: Check failure circuit breaker
+        id: circuit_breaker
+        run: |
+          IS_MANUAL="${{ steps.trigger.outputs.is_manual }}"
+          
+          # Manual triggers bypass circuit breaker
+          if [ "$IS_MANUAL" = "true" ]; then
+            echo "🔧 Manual trigger - bypassing circuit breaker"
+            echo "should_run=true" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+          
+          mkdir -p .github/cache
+          FAILURE_FILE=".github/cache/failure-tracker.json"
+          
+          # Initialize if not exists
+          if [ ! -f "$FAILURE_FILE" ]; then
+            cat > "$FAILURE_FILE" << 'EOF'
+          {
+            "date": "2000-01-01",
+            "count": 0,
+            "last_failure": "2000-01-01T00:00:00Z"
+          }
+          EOF
+          fi
+          
+          # Get today's date
+          TODAY=$(date -u +%Y-%m-%d)
+          
+          # Load failure data
+          FAILURE_DATE=$(jq -r '.date // "2000-01-01"' "$FAILURE_FILE")
+          FAILURE_COUNT=$(jq -r '.count // 0' "$FAILURE_FILE")
+          
+          echo "📊 Circuit Breaker Status:"
+          echo "   Date: $FAILURE_DATE"
+          echo "   Failures: $FAILURE_COUNT"
+          
+          # Check if we have 3+ failures today
+          if [ "$FAILURE_DATE" = "$TODAY" ] && [ "$FAILURE_COUNT" -ge 3 ]; then
+            echo "🛑 Circuit breaker ACTIVE: 3+ failures today"
+            echo "⏸️  Pausing checks until tomorrow"
+            echo "should_run=false" >> $GITHUB_OUTPUT
+          else
+            echo "✅ Circuit breaker OK - proceeding"
+            echo "should_run=true" >> $GITHUB_OUTPUT
+          fi
+      
+      - name: Check for recent game updates (Tiered)
+        if: steps.circuit_breaker.outputs.should_run == 'true' && steps.trigger.outputs.is_manual == 'false'
+        id: game_update
+        run: |
+          echo "🎮 Checking for recent Battlefield game updates (Tiered Detection)..."
+          
+          mkdir -p .github/cache
+          CACHE_FILE=".github/cache/game-update-tracker.json"
+          STEAMDB_URL="https://steamdb.info/app/2807960/history/"
+          EA_NEWS_URL="https://www.ea.com/games/battlefield/battlefield-6/news?page=1&type=game-updates"
+          
+          BOOST_MODE="none"
+          BOOST_LEVEL="none"
+          BOOST_REASON="No recent game update detected"
+          CURRENT_TIME=$(date -u +%s)
+          
+          # Initialize cache if not exists
+          if [ ! -f "$CACHE_FILE" ]; then
+            cat > "$CACHE_FILE" << 'EOF'
+          {
+            "steamdb": {
+              "last_update_date": "2000-01-01T00:00:00Z",
+              "game_version": "unknown",
+              "build_id": "unknown",
+              "manual_trigger": false
+            },
+            "ea_blog": {
+              "last_update_date": "2000-01-01T00:00:00Z",
+              "title": "unknown"
+            },
+            "sdk": {
+              "last_update_date": "2000-01-01T00:00:00Z",
+              "version": "unknown",
+              "matched_game_version": "unknown"
+            },
+            "last_check_date": "2000-01-01T00:00:00Z"
+          }
+          EOF
+          fi
+          
+          # Load cached data
+          STEAMDB_LAST=$(jq -r '.steamdb.last_update_date // "2000-01-01T00:00:00Z"' "$CACHE_FILE")
+          EA_LAST=$(jq -r '.ea_blog.last_update_date // "2000-01-01T00:00:00Z"' "$CACHE_FILE")
+          GAME_VERSION=$(jq -r '.steamdb.game_version // "unknown"' "$CACHE_FILE")
+          
+          # === TIER 1: SteamDB Check (Aggressive Boost - 8 hours) ===
+          echo "🔍 Tier 1: Checking SteamDB update timestamp..."
+          STEAMDB_TIME=$(date -d "$STEAMDB_LAST" +%s 2>/dev/null || date -j -f "%Y-%m-%dT%H:%M:%SZ" "$STEAMDB_LAST" +%s 2>/dev/null || echo "0")
+          
+          if [ "$STEAMDB_TIME" != "0" ]; then
+            HOURS_SINCE_STEAMDB=$((($CURRENT_TIME - $STEAMDB_TIME) / 3600))
+            echo "   Hours since SteamDB update: $HOURS_SINCE_STEAMDB"
+            
+            if [ "$HOURS_SINCE_STEAMDB" -lt 8 ]; then
+              BOOST_MODE="active"
+              BOOST_LEVEL="aggressive"
+              BOOST_REASON="SteamDB game update $HOURS_SINCE_STEAMDB hours ago (v$GAME_VERSION)"
+            fi
+          fi
+          
+          # Try to fetch SteamDB (may be blocked - 403)
+          STEAMDB_HTML=$(curl -s -A "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36" "$STEAMDB_URL" 2>/dev/null || echo "")
+          if [ -n "$STEAMDB_HTML" ] && ! echo "$STEAMDB_HTML" | grep -qi "403\|forbidden\|access denied"; then
+            # Look for recent version updates (basic pattern matching)
+            TODAY=$(date -u +%Y-%m-%d)
+            YESTERDAY=$(date -u -d "yesterday" +%Y-%m-%d 2>/dev/null || date -u -v-1d +%Y-%m-%d 2>/dev/null)
+            
+            if echo "$STEAMDB_HTML" | grep -E "$TODAY|$YESTERDAY" | grep -qi "version\|build\|update"; then
+              BOOST_MODE="active"
+              BOOST_LEVEL="aggressive"
+              BOOST_REASON="New SteamDB update detected"
+              
+              # Update cache with new detection
+              jq ".steamdb.last_update_date = \"$(date -u +%Y-%m-%dT%H:%M:%SZ)\" | .steamdb.manual_trigger = false" "$CACHE_FILE" > "$CACHE_FILE.tmp" && mv "$CACHE_FILE.tmp" "$CACHE_FILE"
+            fi
+          else
+            echo "   ⚠️  SteamDB blocked or inaccessible (using cached data)"
+          fi
+          
+          # === TIER 2: EA Blog Check (Normal Boost - 72 hours) ===
+          if [ "$BOOST_LEVEL" != "aggressive" ]; then
+            echo "🔍 Tier 2: Checking EA blog update timestamp..."
+            EA_TIME=$(date -d "$EA_LAST" +%s 2>/dev/null || date -j -f "%Y-%m-%dT%H:%M:%SZ" "$EA_LAST" +%s 2>/dev/null || echo "0")
+            
+            if [ "$EA_TIME" != "0" ]; then
+              HOURS_SINCE_EA=$((($CURRENT_TIME - $EA_TIME) / 3600))
+              echo "   Hours since EA blog update: $HOURS_SINCE_EA"
+              
+              if [ "$HOURS_SINCE_EA" -lt 72 ]; then
+                BOOST_MODE="active"
+                BOOST_LEVEL="normal"
+                BOOST_REASON="EA blog update $HOURS_SINCE_EA hours ago"
+                echo "   🔔 NORMAL BOOST ACTIVE (EA Blog)"
+              fi
+            fi
+            
+            # Try to fetch EA news page
+            EA_HTML=$(curl -s -A "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36" "$EA_NEWS_URL" 2>/dev/null || echo "")
+            
+            if [ -n "$EA_HTML" ]; then
+              # Look for portal/sdk mentions with recent dates
+              if echo "$EA_HTML" | grep -qi "portal\|sdk"; then
+                TODAY=$(date -u +%Y-%m-%d)
+                YESTERDAY=$(date -u -d "yesterday" +%Y-%m-%d 2>/dev/null || date -u -v-1d +%Y-%m-%d 2>/dev/null)
+                
+                if echo "$EA_HTML" | grep -qi "$TODAY\|$YESTERDAY"; then
+
+                  BOOST_LEVEL="normal"
+                  BOOST_REASON="New EA blog update detected"
+                  
+                  # Update cache
+                  jq ".ea_blog.last_update_date = \"$(date -u +%Y-%m-%dT%H:%M:%SZ)\"" "$CACHE_FILE" > "$CACHE_FILE.tmp" && mv "$CACHE_FILE.tmp" "$CACHE_FILE"
+                fi
+              fi
+            fi
+          fi
+          
+          # Update last check time
+          jq ".last_check_date = \"$(date -u +%Y-%m-%dT%H:%M:%SZ)\"" "$CACHE_FILE" > "$CACHE_FILE.tmp" && mv "$CACHE_FILE.tmp" "$CACHE_FILE"
+          
+          # Output results
+          echo "boost_mode=$BOOST_MODE" >> $GITHUB_OUTPUT
+          echo "boost_level=$BOOST_LEVEL" >> $GITHUB_OUTPUT
+          echo "boost_reason=$BOOST_REASON" >> $GITHUB_OUTPUT
+          echo "game_version=$GAME_VERSION" >> $GITHUB_OUTPUT
+          
+          echo ""
+          echo "=========================================="
+          echo "🚀 Boost Status: $BOOST_MODE"
+          echo "📊 Boost Level: $BOOST_LEVEL"
+          echo "💡 Reason: $BOOST_REASON"
+          echo "🎮 Game Version: $GAME_VERSION"
+          echo "=========================================="
+      
+      - name: Set default game update outputs (manual trigger)
+        if: steps.trigger.outputs.is_manual == 'true'
+        id: game_update_defaults
+        run: |
+          echo "boost_mode=none" >> $GITHUB_OUTPUT
+          echo "boost_level=none" >> $GITHUB_OUTPUT
+          echo "boost_reason=Manual trigger" >> $GITHUB_OUTPUT
+          echo "game_version=unknown" >> $GITHUB_OUTPUT
+      
+      - name: Check work hours (Mon/Tue only)
+        if: steps.circuit_breaker.outputs.should_run == 'true'
+        id: work_hours
+        run: |
+          IS_MANUAL="${{ steps.trigger.outputs.is_manual }}"
+          
+          # Manual trigger: Always run immediately
+          if [ "$IS_MANUAL" = "true" ]; then
+            echo "🔧 Manual trigger - bypassing all schedule checks"
+            echo "should_run=true" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+          
+          HOUR=$(date -u +%H | sed 's/^0//')
+          DAY=$(date -u +%u)
+          BOOST_MODE="${{ steps.game_update.outputs.boost_mode || 'none' }}"
+          BOOST_LEVEL="${{ steps.game_update.outputs.boost_level || 'none' }}"
+          
+          echo "Current hour (UTC): $HOUR"
+          echo "Day of week: $DAY (1=Mon, 7=Sun)"
+          echo "Boost mode: $BOOST_MODE"
+          echo "Boost level: $BOOST_LEVEL"
+          
+          SHOULD_RUN="true"
+          
+          # Aggressive boost: Always run on weekdays (SteamDB update within 8h)
+          if [ "$BOOST_LEVEL" = "aggressive" ] && [ "$DAY" -ge 1 ] && [ "$DAY" -le 5 ]; then
+            echo "⚡ Aggressive boost active - running regardless of time"
+            SHOULD_RUN="true"
+          # Normal boost: Run hourly on weekdays (EA blog update within 72h)
+          elif [ "$BOOST_LEVEL" = "normal" ] && [ "$DAY" -ge 1 ] && [ "$DAY" -le 5 ]; then
+            echo "🔔 Normal boost active - running hourly on weekday"
+            SHOULD_RUN="true"
+          # Regular schedule: Check Mon/Tue work hours (8-20)
+          elif [ "$DAY" = "1" ] || [ "$DAY" = "2" ]; then
+            if [ "$HOUR" -lt 8 ] || [ "$HOUR" -gt 20 ]; then
+              SHOULD_RUN="false"
+              echo "⏰ Outside work hours (8-20 UTC)"
+            fi
+          fi
+          
+          echo "should_run=$SHOULD_RUN" >> $GITHUB_OUTPUT
+      
+      - name: Check for SDK updates
+        if: steps.work_hours.outputs.should_run == 'true'
+        id: check
+        run: |
+          IS_MANUAL="${{ steps.trigger.outputs.is_manual }}"
+          
+          if [ "$IS_MANUAL" = "true" ]; then
+            echo "Portal SDK Update Check"
+            echo "=================================================="
+          fi
+          
+          # Fetch remote versions.json
+          VERSIONS_URL=$(jq -r '.urls.versions' .github/config.json)
+          curl -s -A "Mozilla/5.0 (Macintosh; Intel Mac OS X 10.15; rv:143.0) Gecko/20100101 Firefox/143.0" "$VERSIONS_URL" > /tmp/remote-versions.json
+          
+          REMOTE_VER=$(jq -r '.versions | last | .version' /tmp/remote-versions.json)
+          REMOTE_SIZE=$(jq -r '.versions | last | .fileSize // 0' /tmp/remote-versions.json)
+          
+          # Load local version
+          if [ -f "sdk.version.json" ]; then
+            LOCAL_VER=$(jq -r '.version // "0"' sdk.version.json)
+            LOCAL_SIZE=$(jq -r '.fileSize // .filesize // 0' sdk.version.json)
+          else
+            LOCAL_VER="0"
+            LOCAL_SIZE="0"
+          fi
+          
+          if [ "$IS_MANUAL" = "true" ]; then
+            echo "Local version: $LOCAL_VER ($LOCAL_SIZE bytes)"
+            echo "Remote version: $REMOTE_VER ($REMOTE_SIZE bytes)"
+          fi
+          
+          # Compare
+          UPDATE_NEEDED="false"
+          UPDATE_REASON="No changes detected"
+          
+          if [ "$REMOTE_VER" != "$LOCAL_VER" ]; then
+            UPDATE_NEEDED="true"
+            UPDATE_REASON="Version changed"
+          fi
+          
+          if [ "$REMOTE_SIZE" != "0" ] && [ "$LOCAL_SIZE" != "0" ] && [ "$REMOTE_SIZE" != "$LOCAL_SIZE" ]; then
+            UPDATE_NEEDED="true"
+            if [ "$UPDATE_REASON" = "Version changed" ]; then
+              UPDATE_REASON="Version and filesize changed"
+            else
+              UPDATE_REASON="Filesize changed"
+            fi
+          fi
+          
+          if [ "$IS_MANUAL" = "true" ]; then
+            echo "Update needed: $UPDATE_NEEDED"
+            echo "Update reason: $UPDATE_REASON"
+          fi
+          
+          # Cache remote data
+          mkdir -p .github/cache
+          cp /tmp/remote-versions.json .github/cache/versions.json
+          
+          # Set outputs
+          echo "update_needed=$UPDATE_NEEDED" >> $GITHUB_OUTPUT
+          echo "old_version=$LOCAL_VER" >> $GITHUB_OUTPUT
+          echo "new_version=$REMOTE_VER" >> $GITHUB_OUTPUT
+          echo "old_filesize=$LOCAL_SIZE" >> $GITHUB_OUTPUT
+          echo "new_filesize=$REMOTE_SIZE" >> $GITHUB_OUTPUT
+          echo "update_reason=$UPDATE_REASON" >> $GITHUB_OUTPUT
+          
+          if [ "$IS_MANUAL" = "true" ]; then
+            echo "=================================================="
+            echo "$UPDATE_NEEDED: $UPDATE_REASON"
+          fi
+      
+      - name: Create release of current state
+        if: steps.check.outputs.update_needed == 'true' && steps.check.outputs.old_version != '0'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          OLD_VERSION="${{ steps.check.outputs.old_version }}"
+          
+          echo "📦 Creating release archive for v${OLD_VERSION}..."
+          
+          mkdir -p /tmp/sdk-archive
+          
+          # Copy SDK files only (exclude .git, .github, .gitignore)
+          rsync -av --exclude='.git' --exclude='.github' --exclude='.gitignore' ./ /tmp/sdk-archive/ || echo "No files to archive yet"
+          
+          # Create ZIP
+          cd /tmp/sdk-archive
+          if [ "$(ls -A .)" ]; then
+            zip -r "../portal-sdk_v${OLD_VERSION}.zip" . > /dev/null
+            cd -
+            
+            # Create git tag
+            git tag "portal-sdk_v${OLD_VERSION}" || echo "Tag already exists"
+            git push origin "portal-sdk_v${OLD_VERSION}" || echo "Tag push failed or already exists"
+            
+            # Create GitHub release
+            gh release create "portal-sdk_v${OLD_VERSION}" \
+              "/tmp/portal-sdk_v${OLD_VERSION}.zip" \
+              --title "Portal SDK v${OLD_VERSION}" \
+              --notes "Portal SDK version ${OLD_VERSION} - Snapshot before update to ${{ steps.check.outputs.new_version }}" \
+              || echo "Release already exists"
+            
+            echo "✅ Release created"
+          else
+            echo "ℹ️  No content to release"
+          fi
+      
+      - name: Download SDK
+        if: steps.check.outputs.update_needed == 'true'
+        id: download
+        run: |
+          echo "📥 Downloading Portal SDK..."
+          
+          DOWNLOAD_URL=$(jq -r '.urls.sdk_download' .github/config.json)
+          DOWNLOAD_START=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+          
+          wget -O /tmp/PortalSDK.zip \
+            --user-agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36" \
+            "$DOWNLOAD_URL"
+          
+          DOWNLOAD_END=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+          ZIP_SIZE=$(stat -f%z "/tmp/PortalSDK.zip" 2>/dev/null || stat -c%s "/tmp/PortalSDK.zip")
+          ZIP_SIZE_MB=$(echo "scale=2; $ZIP_SIZE / 1024 / 1024" | bc)
+          
+          echo "download_date=$DOWNLOAD_START" >> $GITHUB_OUTPUT
+          echo "zip_size=$ZIP_SIZE" >> $GITHUB_OUTPUT
+          echo "zip_size_mb=$ZIP_SIZE_MB" >> $GITHUB_OUTPUT
+          
+          echo "✅ Downloaded: ${ZIP_SIZE_MB} MB"
+      
+      - name: Extract SDK
+        if: steps.check.outputs.update_needed == 'true'
+        run: |
+          echo "📦 Extracting new SDK to temporary location..."
+          mkdir -p /tmp/sdk-new
+          unzip -q /tmp/PortalSDK.zip -d /tmp/sdk-new
+          
+          echo "🔄 Syncing only changed files (with exclusions)..."
+          rsync -av --checksum --delete \
+            --exclude='.git' \
+            --exclude='.github' \
+            --exclude='.gitignore' \
+            --exclude='GodotProject/.godot/' \
+            --exclude='FbExportData/thumbnails/' \
+            --exclude='GodotProject/.godot/' \
+            --exclude='GodotProject/scripts/' \
+            --exclude='GodotProject/raw/' \
+            --exclude='python/' \
+            --exclude='*.gd' \
+            --exclude='*.glb' \
+            --exclude='*.exe' \
+            --exclude='GodotProject/objects/**/*.tscn' \
+            --exclude='code/gdconverter/tests/' \
+            --exclude='**/test/' \
+            --exclude='**/tests/' \
+            /tmp/sdk-new/ ./
+          
+          echo "✅ SDK updated (only changed files written, large assets excluded)"
+      
+      - name: Track Godot executable version
+        if: steps.check.outputs.update_needed == 'true'
+        run: |
+          echo "🔍 Detecting Godot executable..."
+          
+          # Find any Godot exe in the extracted SDK
+          GODOT_EXE=$(find /tmp/sdk-new -maxdepth 1 -name 'Godot*.exe' -type f -printf '%f\n' | head -n 1)
+          
+          if [ -n "$GODOT_EXE" ]; then
+            # Remove .exe extension to get base name
+            BASE_NAME="${GODOT_EXE%.exe}"
+            VERSION_FILE="${BASE_NAME}.version"
+            
+            # Create version file in root
+            echo "$GODOT_EXE" > "$VERSION_FILE"
+            
+            echo "✅ Created version file: $VERSION_FILE"
+            echo "   Tracks executable: $GODOT_EXE"
+          else
+            echo "ℹ️  No Godot executable found"
+          fi
+      
+      - name: Generate file comparison
+        if: steps.check.outputs.update_needed == 'true'
+        id: compare
+        run: |
+          echo "🔍 Generating quick comparison using git..."
+          
+          mkdir -p .github/cache
+          
+          # Stage all changes for git to track
+          git add -A
+          
+          # Use git to get accurate change statistics (with defaults)
+          ADDED_COUNT=$(git diff --cached --name-status | grep -c '^A' || echo 0)
+          MODIFIED_COUNT=$(git diff --cached --name-status | grep -c '^M' || echo 0)
+          DELETED_COUNT=$(git diff --cached --name-status | grep -c '^D' || echo 0)
+          
+          # Get current file count
+          NEW_COUNT=$(find . -type f -not -path './.git/*' -not -path './.github/*' | wc -l)
+          
+          # Ensure variables have valid values for JSON
+          ADDED_COUNT=${ADDED_COUNT:-0}
+          MODIFIED_COUNT=${MODIFIED_COUNT:-0}
+          DELETED_COUNT=${DELETED_COUNT:-0}
+          NEW_COUNT=${NEW_COUNT:-0}
+          
+          cat > .github/cache/comparison.json << EOF
+          {
+            "old_version": "${{ steps.check.outputs.old_version }}",
+            "new_version": "${{ steps.check.outputs.new_version }}",
+            "timestamp": "$(date -u +%Y-%m-%dT%H:%M:%SZ)",
+            "summary": {
+              "new_file_count": $NEW_COUNT,
+              "added_count": $ADDED_COUNT,
+              "deleted_count": $DELETED_COUNT,
+              "modified_count": $MODIFIED_COUNT,
+              "note": "Excludes .gd, .glb files, test folders, and GodotProject runtime folders"
+            }
+          }
+          EOF
+          
+          echo "✅ Comparison saved (git-based stats)"
+          cp .github/cache/comparison.json .github/cache/comparison-raw.json
+      
+      - name: Generate changelog
+        if: steps.check.outputs.update_needed == 'true'
+        continue-on-error: true
+        id: changelog
+        uses: actions/github-script@v7
+        env:
+          OLD_VERSION: ${{ steps.check.outputs.old_version }}
+          NEW_VERSION: ${{ steps.check.outputs.new_version }}
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+        with:
+          script: |
+            const fs = require('fs');
+            const comparison = JSON.parse(fs.readFileSync('.github/cache/comparison.json', 'utf8'));
+            const oldVersion = process.env.OLD_VERSION;
+            const newVersion = process.env.NEW_VERSION;
+            const apiKey = process.env.GEMINI_API_KEY;
+            const summary = comparison.summary || {};
+            
+            // Basic changelog function
+            function createBasicChangelog() {
+              const date = new Date().toISOString().split('T')[0];
+              let changelog = `# Portal SDK Changelog\n\n## Version ${newVersion}\n**Released**: ${date}\n**Previous version**: ${oldVersion}\n\n`;
+              
+              if (summary.zip_old_size && summary.zip_new_size) {
+                const oldMB = (summary.zip_old_size / 1024 / 1024).toFixed(2);
+                const newMB = (summary.zip_new_size / 1024 / 1024).toFixed(2);
+                const diff = summary.zip_new_size - summary.zip_old_size;
+                const diffMB = (Math.abs(diff) / 1024 / 1024).toFixed(2);
+                changelog += `### ZIP File Size\n- **Old**: ${oldMB} MB\n- **New**: ${newMB} MB\n- **Change**: ${diff > 0 ? '+' : ''}${diffMB} MB\n\n`;
+              }
+              
+              changelog += `### Summary\n- **Added**: ${summary.added_count || 0} files\n- **Deleted**: ${summary.deleted_count || 0} files\n- **Modified**: ${summary.modified_count || 0} files\n\n`;
+              return changelog;
+            }
+            
+            // If no API key, return basic changelog
+            if (!apiKey) {
+              core.setOutput('changelog', createBasicChangelog());
+              return;
+            }
+            
+            // Build file examples for AI prompt
+            let fileExamples = '';
+            if (summary.added_count > 0) {
+              fileExamples += `\n### Added Files (${summary.added_count} total):\n`;
+              (summary.added || []).slice(0, 15).forEach(f => {
+                const sizeInfo = f.size ? ` (${(f.size / 1024).toFixed(1)} KB)` : '';
+                fileExamples += `- ${f.path}${sizeInfo}\n`;
+              });
+            }
+            if (summary.deleted_count > 0) {
+              fileExamples += `\n### Deleted Files (${summary.deleted_count} total):\n`;
+              (summary.deleted || []).slice(0, 15).forEach(f => {
+                fileExamples += `- ${f.path}\n`;
+              });
+            }
+            if (summary.modified_count > 0) {
+              fileExamples += `\n### Modified Files (${summary.modified_count} total):\n`;
+              (summary.modified || []).slice(0, 15).forEach(f => {
+                let info = '';
+                if (f.is_text && f.lines_changed) info += ` - ~${f.lines_changed} lines changed`;
+                if (f.old_size && f.new_size) {
+                  const diff = f.new_size - f.old_size;
+                  info += ` (${diff > 0 ? '+' : ''}${(diff / 1024).toFixed(1)} KB)`;
+                }
+                fileExamples += `- ${f.path}${info}\n`;
+              });
+            }
+            
+            let zipInfo = '';
+            if (summary.zip_old_size && summary.zip_new_size) {
+              const oldMB = (summary.zip_old_size / 1024 / 1024).toFixed(2);
+              const newMB = (summary.zip_new_size / 1024 / 1024).toFixed(2);
+              const diff = summary.zip_new_size - summary.zip_old_size;
+              const diffMB = (Math.abs(diff) / 1024 / 1024).toFixed(2);
+              zipInfo = `\n### ZIP File Size:\n- Old: ${oldMB} MB\n- New: ${newMB} MB\n- Change: ${diff > 0 ? '+' : ''}${diffMB} MB\n`;
+            }
+            
+            const prompt = `You are an expert technical writer analyzing SDK changes for game developers working with Battlefield Portal.\n\nYour task is to analyze the Battlefield Portal SDK update from version ${oldVersion} to version ${newVersion} and create a clear, actionable changelog.\n\n## Context\nThe Battlefield Portal SDK is used by mod developers and content creators to build custom game modes and experiences. Changes can affect:\n- Available game objects and prefabs\n- Python scripting APIs\n- Godot editor plugins and tools\n- Example projects and documentation\n- Asset availability\n\n## Update Data\n${zipInfo}\n\n### File Statistics:\n- Added: ${summary.added_count || 0} files\n- Deleted: ${summary.deleted_count || 0} files\n- Modified: ${summary.modified_count || 0} files\n- Moved/Renamed: ${summary.moved_count || 0} files\n- Unchanged: ${summary.unchanged_count || 0} files\n\n${fileExamples}\n\n## Your Task\nAnalyze these changes and create a concise, developer-friendly changelog in Markdown format with:\n\n1. **Brief Summary** (2-3 sentences): What's the main focus of this update?\n2. **Key Highlights** (bullet points): What are the most important changes developers should know about?\n3. **Potential Impact** (2-3 sentences): How might these changes affect existing projects? What should developers check or update?\n\n## Guidelines\n- Focus on patterns and meaningful changes (e.g., "Added 50 new props to SouthernCalifornia maps" instead of listing all 50 files)\n- Identify if changes are primarily additive (new content) or breaking (removed/modified content)\n- Mention specific folders/categories when they show significant changes (e.g., "Gameplay/Vehicles", "objects/Cairo")\n- Use clear, concise language\n- Keep response under 500 words\n- Use appropriate emojis for visual clarity\n\nGenerate the changelog now:`;
+            
+            // Call Gemini API
+            try {
+              const response = await fetch(
+                `https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key=${apiKey}`,
+                {
+                  method: 'POST',
+                  headers: { 'Content-Type': 'application/json' },
+                  body: JSON.stringify({
+                    contents: [{ parts: [{ text: prompt }] }],
+                    generationConfig: { temperature: 0.7, maxOutputTokens: 1500 }
+                  })
+                }
+              );
+              
+              const data = await response.json();
+              if (data.candidates?.[0]?.content?.parts?.[0]?.text) {
+                const aiChangelog = `# Portal SDK Changelog\n\n## Version ${newVersion}\n\n` + data.candidates[0].content.parts[0].text;
+                core.setOutput('changelog', aiChangelog);
+                console.log('AI changelog generated successfully');
+              } else {
+                core.setOutput('changelog', createBasicChangelog());
+                console.log('Gemini response unexpected, using basic changelog');
+              }
+            } catch (error) {
+              core.setOutput('changelog', createBasicChangelog());
+              console.log('Gemini request failed, using basic changelog:', error.message);
+            }
+      
+      - name: Update game-SDK version tracker
+        if: steps.check.outputs.update_needed == 'true'
+        run: |
+          CACHE_FILE=".github/cache/game-update-tracker.json"
+          NEW_VERSION="${{ steps.check.outputs.new_version }}"
+          GAME_VERSION="${{ steps.game_update.outputs.game_version || 'unknown' }}"
+          
+          if [ -f "$CACHE_FILE" ]; then
+            echo "📝 Updating game-SDK version mapping..."
+            
+            jq ".sdk.last_update_date = \"$(date -u +%Y-%m-%dT%H:%M:%SZ)\" | \
+                .sdk.version = \"$NEW_VERSION\" | \
+                .sdk.matched_game_version = \"$GAME_VERSION\"" \
+                "$CACHE_FILE" > "$CACHE_FILE.tmp" && mv "$CACHE_FILE.tmp" "$CACHE_FILE"
+            
+            echo "✅ Linked SDK v$NEW_VERSION with game v$GAME_VERSION"
+          fi
+      
+      - name: Create branch and commit changes
+        if: steps.check.outputs.update_needed == 'true'
+        id: create_branch
+        run: |
+          NEW_VERSION="${{ steps.check.outputs.new_version }}"
+          BRANCH_NAME="sdk-update-v${NEW_VERSION}"
+          
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          
+          # Stash any uncommitted changes (e.g., failure-tracker.json)
+          echo "💾 Stashing uncommitted changes..."
+          git stash push -u -m "Temporary stash before branch switch" || echo "Nothing to stash"
+          
+          # Fetch remote branches to see if our branch exists
+          git fetch origin
+          
+          # Check if branch exists remotely
+          if git ls-remote --exit-code --heads origin "$BRANCH_NAME" >/dev/null 2>&1; then
+            echo "📌 Branch $BRANCH_NAME exists remotely - checking out and pulling latest"
+            
+            # Checkout existing branch
+            git checkout "$BRANCH_NAME" 2>/dev/null || git checkout -b "$BRANCH_NAME" --track "origin/$BRANCH_NAME"
+            
+            # Pull latest changes from remote (rebase to avoid merge commits)
+            git pull --rebase origin "$BRANCH_NAME" || {
+              echo "⚠️  Rebase conflict detected - using ours strategy"
+              git rebase --abort 2>/dev/null || true
+              git reset --hard "origin/$BRANCH_NAME"
+            }
+          else
+            echo "🆕 Creating new branch $BRANCH_NAME"
+            git checkout -b "$BRANCH_NAME"
+          fi
+          
+          # Pop stashed changes back
+          echo "📤 Restoring stashed changes..."
+          git stash pop || echo "No stash to pop"
+          
+          # Commit all changes
+          git add -A
+          git commit -m "Update Portal SDK to v${NEW_VERSION}" || echo "No changes to commit"
+          
+          # Push branch (normal push, no force)
+          git push -u origin "$BRANCH_NAME"
+          
+          echo "branch_name=$BRANCH_NAME" >> $GITHUB_OUTPUT
+      
+      - name: Create Pull Request
+        if: steps.check.outputs.update_needed == 'true'
+        id: create_pr
+        uses: actions/github-script@v7
+        env:
+          OLD_VERSION: ${{ steps.check.outputs.old_version }}
+          NEW_VERSION: ${{ steps.check.outputs.new_version }}
+          BRANCH_NAME: ${{ steps.create_branch.outputs.branch_name }}
+          CHANGELOG: ${{ steps.changelog.outputs.changelog }}
+        with:
+          script: |
+            const fs = require('fs');
+            const oldVersion = process.env.OLD_VERSION;
+            const newVersion = process.env.NEW_VERSION;
+            const branchName = process.env.BRANCH_NAME;
+            const changelog = process.env.CHANGELOG || '';
+            
+            let comparison = {};
+            try {
+              comparison = JSON.parse(fs.readFileSync('.github/cache/comparison.json', 'utf8'));
+            } catch (e) {}
+            
+            const summary = comparison.summary || {};
+            
+            const prBody = `## Portal SDK Update: v${oldVersion} → v${newVersion}
+            
+            This PR updates the Portal SDK from version **${oldVersion}** to **${newVersion}**.
+            
+            ### 📊 Summary
+            - **Files in SDK**: ${summary.new_file_count || 'N/A'}
+            - **Added**: ${summary.added_count || 0} files
+            - **Modified**: ${summary.modified_count || 0} files
+            - **Deleted**: ${summary.deleted_count || 0} files
+            
+            ${summary.note ? `> **Note**: ${summary.note}\n` : ''}
+            
+            ### 📝 Changelog
+            
+            ${changelog}
+            
+            ---
+            
+            **Automated Actions Completed:**
+            - ✅ Downloaded and extracted SDK
+            - ✅ Created release for v${oldVersion}
+            - ✅ Generated file comparison
+            - ✅ AI changelog generated
+            - ✅ Updated game-SDK version tracker
+            
+            **Review and merge this PR to:**
+            - Update the main branch with new SDK files
+            - Trigger dependent repository workflows
+            - Create tracking issue
+            
+            *This PR was automatically created by the SDK update workflow.*
+            `;
+            
+            const pr = await github.rest.pulls.create({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              title: `SDK Update: v${oldVersion} → v${newVersion}`,
+              head: branchName,
+              base: 'main',
+              body: prBody
+            });
+            
+            console.log(`✅ Created PR #${pr.data.number}`);
+            core.setOutput('pr_number', pr.data.number);
+            core.setOutput('pr_url', pr.data.html_url);
+      
+      - name: Create GitHub issue for update
+        if: steps.check.outputs.update_needed == 'true'
+        id: create_issue
+        uses: actions/github-script@v7
+        env:
+          OLD_VERSION: ${{ steps.check.outputs.old_version }}
+          NEW_VERSION: ${{ steps.check.outputs.new_version }}
+          UPDATE_REASON: ${{ steps.check.outputs.update_reason }}
+          PR_NUMBER: ${{ steps.create_pr.outputs.pr_number }}
+          PR_URL: ${{ steps.create_pr.outputs.pr_url }}
+          CHANGELOG: ${{ steps.changelog.outputs.changelog }}
+        with:
+          script: |
+            const fs = require('fs');
+            const oldVersion = process.env.OLD_VERSION;
+            const newVersion = process.env.NEW_VERSION;
+            const updateReason = process.env.UPDATE_REASON;
+            const prNumber = process.env.PR_NUMBER;
+            const prUrl = process.env.PR_URL;
+            const changelog = process.env.CHANGELOG || '';
+            
+            let comparison = {};
+            try {
+              comparison = JSON.parse(fs.readFileSync('.github/cache/comparison.json', 'utf8'));
+            } catch (e) {}
+            
+            const issueBody = `## Portal SDK Update Detected
+            
+            A new version of the Portal SDK has been detected and downloaded.
+            
+            ### 📦 Pull Request
+            **Review and merge**: [#${prNumber}](${prUrl})
+            
+            ### 📋 Version Information
+            - **Previous Version**: \`${oldVersion}\`
+            - **New Version**: \`${newVersion}\`
+            - **Update Reason**: ${updateReason}
+            - **Detected**: ${new Date().toISOString()}
+            
+            ### 📊 File Changes
+            - **Files in new SDK**: ${comparison.summary?.new_file_count || 'N/A'}
+            - **Added**: ${comparison.summary?.added_count || 0} files
+            - **Modified**: ${comparison.summary?.modified_count || 0} files
+            - **Deleted**: ${comparison.summary?.deleted_count || 0} files
+            
+            ${comparison.summary?.note ? `> **Note**: ${comparison.summary.note}\n` : ''}
+            
+            ### 📝 Changelog
+            
+            ${changelog}
+            
+            ---
+            
+            **Next Steps:**
+            1. Review the [Pull Request #${prNumber}](${prUrl})
+            2. Merge the PR to update main branch
+            3. Download SDK from [releases](https://github.com/${context.repo.owner}/${context.repo.repo}/releases/tag/portal-sdk_v${oldVersion})
+            4. Check dependent repositories for triggered workflows
+            
+            *This issue was automatically created by the SDK update workflow.*
+            `;
+            
+            const issue = await github.rest.issues.create({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              title: `New SDK Update: Migrating from v${oldVersion} to v${newVersion}`,
+              body: issueBody,
+              labels: ['sdk-update', 'automated']
+            });
+            
+            console.log(`✅ Created issue #${issue.data.number}`);
+            core.setOutput('issue_number', issue.data.number);
+      
+      - name: Trigger workflow in target repository
+        if: steps.check.outputs.update_needed == 'true'
+        uses: actions/github-script@v7
+        env:
+          OLD_VERSION: ${{ steps.check.outputs.old_version }}
+          NEW_VERSION: ${{ steps.check.outputs.new_version }}
+          PR_NUMBER: ${{ steps.create_pr.outputs.pr_number }}
+          PR_URL: ${{ steps.create_pr.outputs.pr_url }}
+          ISSUE_NUMBER: ${{ steps.create_issue.outputs.issue_number }}
+          CHANGELOG: ${{ steps.changelog.outputs.changelog }}
+        with:
+          script: |
+            const fs = require('fs');
+            const config = JSON.parse(fs.readFileSync('.github/config.json', 'utf8'));
+            
+            let comparisonRaw = '';
+            try {
+              comparisonRaw = fs.readFileSync('.github/cache/comparison-raw.json', 'utf8');
+            } catch (e) {}
+            
+            const changelogAI = process.env.CHANGELOG || '';
+            
+            const targetRepo = config.github.target_repo || 'YOUR_ORG/target-repo';
+            const [targetOwner, targetRepoName] = targetRepo.split('/');
+            
+            if (targetOwner === 'YOUR_ORG') {
+              console.log('⚠️  Target repository not configured in .github/config.json');
+              console.log('   Skipping workflow trigger');
+              return;
+            }
+            
+            console.log(`🚀 Triggering workflow in ${targetRepo}...`);
+            
+            try {
+              await github.rest.repos.createDispatchEvent({
+                owner: targetOwner,
+                repo: targetRepoName,
+                event_type: 'sdk-updated',
+                client_payload: {
+                  old_version: process.env.OLD_VERSION,
+                  new_version: process.env.NEW_VERSION,
+                  source_repo: `${context.repo.owner}/${context.repo.repo}`,
+                  pr_number: process.env.PR_NUMBER,
+                  pr_url: process.env.PR_URL,
+                  issue_number: process.env.ISSUE_NUMBER,
+                  comparison_raw: comparisonRaw,
+                  changelog_ai: changelogAI,
+                  timestamp: new Date().toISOString()
+                }
+              });
+              
+              console.log('✅ Workflow triggered successfully');
+            } catch (error) {
+              console.log('⚠️  Could not trigger workflow:', error.message);
+            }
+      
+      - name: Summary
+        if: steps.check.outputs.update_needed == 'true'
+        run: |
+          echo "✅ SDK Update Branch Created"
+          echo "Old version: ${{ steps.check.outputs.old_version }}"
+          echo "New version: ${{ steps.check.outputs.new_version }}"
+          echo "Branch: ${{ steps.create_branch.outputs.branch_name }}"
+          echo "PR: #${{ steps.create_pr.outputs.pr_number }}"
+          echo "Issue: #${{ steps.create_issue.outputs.issue_number }}"
+          echo ""
+          echo "Next: Review and merge PR #${{ steps.create_pr.outputs.pr_number }}"
+      
+      - name: Reset failure counter on success
+        if: steps.check.outputs.update_needed == 'true' && success()
+        run: |
+          mkdir -p .github/cache
+          FAILURE_FILE=".github/cache/failure-tracker.json"
+          
+          cat > "$FAILURE_FILE" << 'EOF'
+          {
+            "date": "2000-01-01",
+            "count": 0,
+            "last_failure": "2000-01-01T00:00:00Z"
+          }
+          EOF
+          
+          echo "✅ Reset failure counter"
+      
+      - name: Save circuit breaker cache (success)
+        if: always()
+        uses: actions/cache/save@v3
+        with:
+          path: .github/cache/failure-tracker.json
+          key: circuit-breaker-${{ github.run_id }}
+      
+      - name: Track workflow failure
+        if: failure() && steps.trigger.outputs.is_manual == 'false'
+        run: |
+          mkdir -p .github/cache
+          FAILURE_FILE=".github/cache/failure-tracker.json"
+          TODAY=$(date -u +%Y-%m-%d)
+          NOW=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+          
+          # Initialize if not exists
+          if [ ! -f "$FAILURE_FILE" ]; then
+            cat > "$FAILURE_FILE" << 'EOF'
+          {
+            "date": "2000-01-01",
+            "count": 0,
+            "last_failure": "2000-01-01T00:00:00Z"
+          }
+          EOF
+          fi
+          
+          # Load current data
+          FAILURE_DATE=$(jq -r '.date // "2000-01-01"' "$FAILURE_FILE")
+          FAILURE_COUNT=$(jq -r '.count // 0' "$FAILURE_FILE")
+          
+          # Reset counter if different day
+          if [ "$FAILURE_DATE" != "$TODAY" ]; then
+            FAILURE_COUNT=0
+          fi
+          
+          # Increment counter
+          FAILURE_COUNT=$((FAILURE_COUNT + 1))
+          
+          # Save updated data
+          jq -n \
+            --arg date "$TODAY" \
+            --argjson count "$FAILURE_COUNT" \
+            --arg last "$NOW" \
+            '{"date": $date, "count": $count, "last_failure": $last}' \
+            > "$FAILURE_FILE"
+          
+          echo "❌ Failure tracked: $FAILURE_COUNT on $TODAY"
+          
+          if [ "$FAILURE_COUNT" -ge 3 ]; then
+            echo "🛑 Circuit breaker will activate on next run"
+          fi
+          
+          echo "💾 State will be saved to cache for next run"
