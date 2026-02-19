@@ -80,6 +80,43 @@ When environment variables would be better:
 
 **Decision**: Keep step outputs unless requirements change significantly.
 
+### GitHub Actions Permissions
+**When creating Pull Requests or Issues via `actions/github-script`, explicit permissions are required.**
+
+Key learnings:
+- The GitHub Actions token (`${{ github.token }}`) has limited default permissions
+- Creating resources via GitHub REST API requires explicit permission grants
+- Missing permissions result in **403 "Resource not accessible by integration"** errors
+
+**Required Permissions for This Workflow:**
+```yaml
+permissions:
+  contents: write        # For commits, tags, pushing to branches, creating releases
+  issues: write          # For creating GitHub issues
+  pull-requests: write   # For creating Pull Requests via API
+```
+
+**Common Permission Errors:**
+- **Creating PR without `pull-requests: write`**: 403 error when calling `github.rest.pulls.create()`
+- **Creating issue without `issues: write`**: 403 error when calling `github.rest.issues.create()`
+- **Pushing commits without `contents: write`**: 403 error on `git push`
+
+**Best Practice:**
+- Always declare permissions explicitly in workflow file
+- Grant minimum required permissions (principle of least privilege)
+- Test with manual workflow dispatch after adding new API calls
+- Check GitHub Actions documentation for specific endpoint requirements
+
+**Alternative Approaches:**
+- Use dedicated actions like `peter-evans/create-pull-request` (manages permissions internally)
+- Use Personal Access Token (PAT) with broader permissions (less secure)
+- Keep using `github.token` with explicit permissions (RECOMMENDED)
+
+**Troubleshooting:**
+1. If you see "Resource not accessible by integration" → Check permissions block
+2. If permissions are correct but still failing → Verify API endpoint requirements
+3. If using organization repository → Check organization-level security settings
+
 ## Repository Purpose
 
 This repository is an **automated mirror** of the Battlefield Portal SDK from EA/DICE. It serves as:
@@ -115,6 +152,8 @@ Everything automation-related lives here (NOT in separate automation/ folder):
   * `failure-tracker.json` - Circuit breaker state (persisted via Actions cache, ignored)
   * `.gitkeep` - Preserves cache folder in git
 - `workflows/sdk-check-updates.yml` - **CRITICAL**: Main automation workflow (NEVER DELETE)
+- `workflows/sdk-merged-notification.yml` - Notifies dependent repos when PR is merged to main
+- `workflows/sdk-create-release.yml` - Creates stable release when PR is merged to main
 - `copilot-instructions.md` - This file
 
 NOTE: Version checking and changelog generation are done INLINE in the workflow using bash scripts and `actions/github-script`. No separate .js files needed.
@@ -122,20 +161,22 @@ NOTE: Version checking and changelog generation are done INLINE in the workflow 
 ## Workflow Overview
 
 ### Schedule
-The workflow uses a **smart adaptive schedule** with tiered boost modes:
+The workflow uses a **fixed schedule** with internal boost logic:
 
-**Normal Schedule** (configured in `config.json`):
-- **Monday**: Every hour between 8 AM - 8 PM UTC
-- **Tuesday**: Every hour between 8 AM - 8 PM UTC
-- **Wednesday-Friday**: Every 4 hours
-- **Saturday-Sunday**: Every 6 hours
+**Cron Schedule:**
+- **Monday**: Every hour between 8 AM - 8 PM UTC (`0 8-20 * * 1`)
+- **Tuesday**: Every hour between 8 AM - 8 PM UTC (`0 8-20 * * 2`)
+- **Wednesday-Friday**: Every 4 hours (`0 */4 * * 3-5`)
+- **Saturday-Sunday**: Every 6 hours (`0 */6 * * 0,6`)
 
 **Tiered Boost System** (automatic game update detection):
+
+The workflow checks boost conditions on each scheduled run and decides whether to proceed:
 
 **Tier 1 - Aggressive Boost** (SteamDB):
 - **Trigger**: Game update detected on SteamDB (https://steamdb.info/app/2807960/history/)
 - **Duration**: Active for 8 hours after detection
-- **Frequency**: Every 30 minutes on weekdays (Mon-Fri), any time of day
+- **Behavior**: Bypasses work hour restrictions, proceeds with SDK check
 - **Reason**: SDK usually releases within hours of game update
 - **Manual Override**: Can manually update cache to trigger aggressive boost
 - **Falls back to**: Normal boost after 8 hours
@@ -143,13 +184,14 @@ The workflow uses a **smart adaptive schedule** with tiered boost modes:
 **Tier 2 - Normal Boost** (EA Blog):
 - **Trigger**: Game update on EA news page (https://www.ea.com/games/battlefield/battlefield-6/news)
 - **Duration**: Active for 72 hours (3 days) after detection
-- **Frequency**: Every 1 hour on weekdays (Mon-Fri), any time of day
+- **Behavior**: Bypasses work hour restrictions on weekdays, proceeds with SDK check
 - **Detection**: Monitors for updates mentioning "portal" or "sdk"
 - **Falls back to**: Regular schedule after 72 hours
 
 **Tier 3 - Regular Schedule**:
 - No recent game updates detected
-- Follows normal schedule (Mon/Tue hourly 8-20, Wed-Fri every 4h, Sat-Sun every 6h)
+- Follows work hour restrictions (Mon/Tue 8-20 UTC only)
+- Other days follow cron schedule without additional restrictions
 
 **Manual Trigger** (workflow_dispatch):
 - **Priority**: Highest - bypasses ALL schedule checks
@@ -256,15 +298,16 @@ The workflow uses a **smart adaptive schedule** with tiered boost modes:
      * File counts (added/deleted/modified)
    - Uses native `fetch` API in GitHub Actions environment
 
-7. **Pre-Update Release Creation**
+7. **Archive Release Creation (Before Update)**
    - Creates a release/tag of the CURRENT state before updating
-   - Tag format: `portal-sdk_v{current_version}`
+   - Tag format: `portal-sdk_v{current_version}-archive`
+   - ZIP filename: `portal-sdk_v{current_version}-archive.zip`
    - ZIP contains only SDK files from root (excludes .github/, .git/)
    - Release notes include:
      * Current version number
-     * ZIP file size
-     * Download date
-   - Preserves history of each version
+     * Marked as "Archive" snapshot
+     * Reference to version being updated to
+   - Preserves history of each version before changes
 
 8. **GitHub Issue Creation**
    - Automatically creates issue with title: "SDK Update: v{old} → v{new}"
@@ -306,6 +349,16 @@ The workflow uses a **smart adaptive schedule** with tiered boost modes:
    - **NEVER uses force push** - always respects remote state
    - Workflow completes (merge is manual or via auto-merge)
 
+11. **Stable Release Creation (After Merge)**
+   - Triggered by `sdk-create-release.yml` workflow when PR is merged to main
+   - Creates a release/tag of the NEW stable version
+   - Tag format: `portal-sdk_v{new_version}-release`
+   - ZIP filename: `portal-sdk_v{new_version}-release.zip`
+   - ZIP contains only SDK files from root (excludes .github/, .git/)
+   - Release notes marked as "Release" (stable version)
+   - This is always the current production-ready SDK
+   - Notifies dependent repositories via `sdk-merged` event
+
 ## Configuration
 
 ### .github/config.json
@@ -338,7 +391,10 @@ The workflow uses a **smart adaptive schedule** with tiered boost modes:
     "trigger_workflow": "sdk-updated.yml"
   },
   "release": {
-    "tag_prefix": "portal-sdk_v",
+    "archive_tag_prefix": "portal-sdk_v",
+    "archive_tag_suffix": "-archive",
+    "release_tag_prefix": "portal-sdk_v",
+    "release_tag_suffix": "-release",
     "create_github_release": true
   }
 }
@@ -348,23 +404,33 @@ The workflow uses a **smart adaptive schedule** with tiered boost modes:
 To receive update notifications in another repo:
 
 1. Set `github.target_repo` in `.github/config.json` to `"your-org/your-repo"`
-2. In target repo, create workflow file `.github/workflows/sdk-updated.yml`:
+2. In target repo, create workflow file `.github/workflows/sdk-events.yml`:
 
 ```yaml
-name: SDK Updated
+name: Handle SDK Events
+
 on:
   repository_dispatch:
-    types: [sdk-updated]
+    types: 
+      - sdk-updated  # PR created (SDK on branch)
+      - sdk-merged   # PR merged (SDK on main)
 
 jobs:
   handle-update:
     runs-on: ubuntu-latest
     steps:
-      - name: Process SDK update
+      - name: Log event details
         run: |
+          echo "Event type: ${{ github.event.action }}"
+          echo "Source repo: ${{ github.event.client_payload.source_repo }}"
+          echo "Timestamp: ${{ github.event.client_payload.timestamp }}"
+      
+      - name: Handle PR created (sdk-updated)
+        if: github.event.action == 'sdk-updated'
+        run: |
+          echo "SDK Update PR Created"
           echo "Old version: ${{ github.event.client_payload.old_version }}"
           echo "New version: ${{ github.event.client_payload.new_version }}"
-          echo "Source repo: ${{ github.event.client_payload.source_repo }}"
           echo "Pull Request: ${{ github.event.client_payload.pr_url }}"
           echo "Issue: ${{ github.event.client_payload.issue_number }}"
           
@@ -373,7 +439,25 @@ jobs:
           
           # Access AI changelog
           echo "${{ github.event.client_payload.changelog_ai }}" > changelog.md
+      
+      - name: Handle PR merged (sdk-merged)
+        if: github.event.action == 'sdk-merged'
+        run: |
+          echo "SDK Update Merged to Main"
+          echo "Version: ${{ github.event.client_payload.sdk_version }}"
+          echo "Previous: ${{ github.event.client_payload.previous_version }}"
+          echo "PR: ${{ github.event.client_payload.pr_url }}"
+          echo "Merged by: ${{ github.event.client_payload.merged_by }}"
+          echo "Release: ${{ github.event.client_payload.release_url }}"
+          
+          # This is the production-ready SDK on main branch
+          # Trigger your deployment, tests, or other workflows here
 ```
+
+**Event Comparison:**
+- **`sdk-updated`**: Fired when PR is created (SDK files on branch, not yet on main)
+- **`sdk-merged`**: Fired when PR is merged (SDK files now on main, production-ready)
+- **Recommendation**: Use `sdk-merged` for production workflows
 
 ## Key Design Principles
 
@@ -433,16 +517,19 @@ jobs:
 - Provides visibility into what changed
 
 ### 8. Cross-Repository Integration
-- `repository_dispatch` events to trigger workflows elsewhere
-- Passes comprehensive metadata (sizes, dates, versions)
-- Passes both raw data and AI analysis
-- Allows dependent repos to react to updates automatically
+- Two workflows send `repository_dispatch` events:
+  * **sdk-check-updates.yml**: Sends `sdk-updated` event when PR is created
+  * **sdk-merged-notification.yml**: Sends `sdk-merged` event when PR is merged to main
+- Passes comprehensive metadata (sizes, dates, versions, PR info)
+- Dependent repos can listen to either or both events
+- **Recommended**: Use `sdk-merged` event for production updates (main branch)
 
-### 9. The Workflow File is Critical
-- `.github/workflows/sdk-check-updates.yml` is THE ONLY THING REALLY NEEDED
-- NEVER delete or attempt to remove the workflow file
-- It orchestrates everything
-- Without it, nothing works
+### 9. The Workflow Files are Critical
+- `.github/workflows/sdk-check-updates.yml` - Detects and creates PRs (NEVER DELETE)
+- `.github/workflows/sdk-merged-notification.yml` - Notifies dependent repos on merge (NEVER DELETE)
+- `.github/workflows/sdk-create-release.yml` - Creates stable releases on merge (NEVER DELETE)
+- They orchestrate the entire automation
+- Without them, nothing works
 
 ### 10. Git Safety - Never Force Push
 - ALWAYS respect remote branch state
@@ -467,6 +554,8 @@ When asked to:
 - Read `.github/cache/comparison.json`
 - Look at latest GitHub issue with `sdk-update` label
 - Check git log for latest commit message
+- Check latest release (look for `-release` tag for current stable)
+- Check archive releases (look for `-archive` tags for historical snapshots)
 
 **"Add files to the SDK"**
 - DO NOT do this! Root is for SDK files only
@@ -480,14 +569,22 @@ When asked to:
 - Both must stay synchronized
 
 **"See version history"**
-- Check git tags (format: `portal-sdk_v{version}`)
-- Look at GitHub releases (one per version)
-- Each release includes ZIP size and download date
+- Check git tags (format: `portal-sdk_v{version}-archive` for snapshots, `portal-sdk_v{version}-release` for stable)
+- Look at GitHub releases:
+  * `-archive` releases: Historical snapshots before updates
+  * `-release` releases: Current stable versions (production-ready)
+- Each version has two releases:
+  * Archive: Created when update detected (old version snapshot)
+  * Release: Created after PR merged (new stable version)
 
 **"Compare two versions"**
-- Each version is tagged in git
-- Each version has a release
+- Each version has two git tags:
+  * `portal-sdk_v{version}-archive`: Snapshot before update
+  * `portal-sdk_v{version}-release`: Stable version after merge
+- Each version has two releases with ZIPs
 - Comparison JSON includes file sizes and line changes
+- To get current stable: Look for latest `-release` tag
+- To get historical snapshot: Look for corresponding `-archive` tag
 
 **"Fix the workflow" or "Update automation"**
 - Edit workflow file in `.github/workflows/` directory
@@ -564,6 +661,17 @@ When asked to:
 - AI analysis of changes (if Gemini key available)
 
 ## Secrets Required
+
+### Required Workflow Permissions:
+The workflow requires explicit permissions in the workflow file (NOT secrets):
+```yaml
+permissions:
+  contents: write        # For git operations and releases
+  issues: write          # For creating tracking issues
+  pull-requests: write   # For creating Pull Requests
+```
+
+See **GitHub Actions Permissions** section for detailed explanation.
 
 ### Optional but Recommended:
 - `GEMINI_API_KEY` - For AI-powered changelog generation (Google Gemini 1.5-flash)
@@ -775,8 +883,8 @@ size=$(stat -c%s "$file" 2>/dev/null || stat -f%z "$file" 2>/dev/null)
 
 ---
 
-**Last Updated**: 2026-02-17
+**Last Updated**: 2026-02-18
 **Repository**: Battlefield Portal SDK Mirror
-**Structure Version**: 3.3 (Circuit breaker, PR workflow, optimized file extraction)
+**Structure Version**: 3.6 (Three-workflow system: detection/archive → notification → release)
 **Implementation**: Inline bash + actions/github-script (no external scripts)
 **AI Provider**: Google Gemini 1.5-flash
