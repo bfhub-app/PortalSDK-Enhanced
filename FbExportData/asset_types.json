@@ -123389,6 +123389,30 @@
       "levelRestrictions": []
     },
     {
+      "type": "FixedCamera",
+      "directory": "Gameplay/Common",
+      "constants": [
+        {
+          "name": "mesh",
+          "type": "string",
+          "value": "FixedCamera"
+        },
+        {
+          "name": "category",
+          "type": "string",
+          "value": "spatial"
+        }
+      ],
+      "properties": [
+        {
+          "name": "ObjId",
+          "type": "int",
+          "default": -1
+        }
+      ],
+      "levelRestrictions": []
+    },
+    {
       "type": "FX_Airburst_Incendiary_Detonation",
       "directory": "FX",
       "constants": [
@@ -170216,6 +170240,30 @@
         }
       ],
       "properties": [],
+      "levelRestrictions": []
+    },
+    {
+      "type": "VEH_AH6M",
+      "directory": "Gameplay/Vehicles",
+      "constants": [
+        {
+          "name": "mesh",
+          "type": "string",
+          "value": "VEH_AH6M"
+        },
+        {
+          "name": "category",
+          "type": "string",
+          "value": "spatial"
+        }
+      ],
+      "properties": [
+        {
+          "name": "ObjId",
+          "type": "int",
+          "default": -1
+        }
+      ],
       "levelRestrictions": []
     },
     {
@@ -252350,6 +252398,7 @@
             "Gepard",
             "UH60",
             "Eurocopter",
+            "AH6M",
             "AH64",
             "Vector",
             "Quadbike",
