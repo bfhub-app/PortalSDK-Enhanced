@@ -16,7 +16,7 @@ jobs:
     
     steps:
       - name: Trigger workflow in target repository
-        uses: actions/github-script@v7
+        uses: actions/github-script@v9
         env:
           TARGET_REPO: ${{ secrets.TARGET_REPO }}
         with:
@@ -65,8 +65,8 @@ jobs:
                   merged_by: pr.merged_by?.login || 'unknown',
                   merged_at: pr.merged_at,
                   changelog: changelog,
-                  release_tag: `portal-sdk_v${sdkVersion}-release`,
-                  release_url: `https://github.com/${context.repo.owner}/${context.repo.repo}/releases/tag/portal-sdk_v${sdkVersion}-release`,
+                  release_tag: `portal-sdk_v${sdkVersion}`,
+                  release_url: `https://github.com/${context.repo.owner}/${context.repo.repo}/releases/tag/portal-sdk_v${sdkVersion}`,
                   timestamp: new Date().toISOString()
                 }
               });
