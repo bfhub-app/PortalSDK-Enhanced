@@ -7,6 +7,7 @@ on:
 
 permissions:
   contents: write
+  issues: write
 
 jobs:
   create-release:
@@ -16,9 +17,23 @@ jobs:
     
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           ref: main
+
+      - name: Write release notes from PR body
+        uses: actions/github-script@v9
+        with:
+          script: |
+            const fs = require('fs');
+            const pr = context.payload.pull_request;
+            const branchName = pr.head.ref;
+            const sdkVersion = branchName.replace('sdk-update-v', '');
+            const body = pr.body && pr.body.trim()
+              ? pr.body.trim()
+              : `Portal SDK version ${sdkVersion} - Stable release`;
+
+            fs.writeFileSync('/tmp/portal-sdk-release-notes.md', body, 'utf8');
       
       - name: Create stable release
         env:
@@ -34,20 +49,68 @@ jobs:
           rsync -av --exclude='.git' --exclude='.github' --exclude='.gitignore' ./ /tmp/sdk-release/
           
           cd /tmp/sdk-release
-          zip -r "../portal-sdk_v${SDK_VERSION}-release.zip" . > /dev/null
+          zip -r "../portal-sdk_v${SDK_VERSION}.zip" . > /dev/null
           cd -
           
-          git tag "portal-sdk_v${SDK_VERSION}-release" || echo "Tag already exists"
-          git push origin "portal-sdk_v${SDK_VERSION}-release" || echo "Tag push failed or already exists"
+          git tag "portal-sdk_v${SDK_VERSION}" || echo "Tag already exists"
+          git push origin "portal-sdk_v${SDK_VERSION}" || echo "Tag push failed or already exists"
           
-          gh release create "portal-sdk_v${SDK_VERSION}-release" \
-            "/tmp/portal-sdk_v${SDK_VERSION}-release.zip" \
+          gh release create "portal-sdk_v${SDK_VERSION}" \
+            "/tmp/portal-sdk_v${SDK_VERSION}.zip" \
             --title "Portal SDK v${SDK_VERSION} (Release)" \
-            --notes "Portal SDK version ${SDK_VERSION} - Stable release" \
-            || echo "Release already exists"
+            --notes-file "/tmp/portal-sdk-release-notes.md" \
+            || gh release edit "portal-sdk_v${SDK_VERSION}" \
+              --title "Portal SDK v${SDK_VERSION} (Release)" \
+              --notes-file "/tmp/portal-sdk-release-notes.md"
           
           echo "✅ Stable release created"
       
+      - name: Close related update issue
+        uses: actions/github-script@v9
+        with:
+          script: |
+            const pr = context.payload.pull_request;
+            const prNumber = pr.number;
+            const prUrl = pr.html_url;
+            const issues = await github.paginate(github.rest.issues.listForRepo, {
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              state: 'open',
+              labels: 'sdk-update',
+              per_page: 100
+            });
+            const relatedIssue = issues.find(issue => {
+              if (issue.pull_request) {
+                return false;
+              }
+              const body = issue.body || '';
+              return body.includes(`[#${prNumber}](${prUrl})`) ||
+                body.includes(`Pull Request #${prNumber}`) ||
+                body.includes(`/pull/${prNumber}`);
+            });
+
+            if (!relatedIssue) {
+              core.info(`No open sdk-update issue found for PR #${prNumber}.`);
+              return;
+            }
+
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: relatedIssue.number,
+              body: `Closing automatically because SDK update PR #${prNumber} was merged.`
+            });
+
+            await github.rest.issues.update({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: relatedIssue.number,
+              state: 'closed',
+              state_reason: 'completed'
+            });
+
+            core.info(`Closed related issue #${relatedIssue.number}.`);
+
       - name: Summary
         run: |
           BRANCH_NAME="${{ github.event.pull_request.head.ref }}"
@@ -55,5 +118,5 @@ jobs:
           
           echo "✅ Stable Release Created"
           echo "Version: $SDK_VERSION"
-          echo "Tag: portal-sdk_v${SDK_VERSION}-release"
+          echo "Tag: portal-sdk_v${SDK_VERSION}"
           echo "PR: #${{ github.event.pull_request.number }}"
